@@ -48,7 +48,6 @@ import {
 import { CODEMODE_SOURCE_GRAMMAR, parseCodemodeSource } from "@earendil-works/pi-codemode/source";
 import { type Static, Type } from "typebox";
 import { defineDoc } from "../documents.ts";
-import type { ExecutionEnv } from "../env/index.ts";
 import { errorMessage } from "../errors.ts";
 import { defineExtension, defineTool, section } from "../harness/define.ts";
 import { NestedCallDoc, type ToolTaskInput } from "../harness/tool.ts";
@@ -61,6 +60,7 @@ import type {
 } from "../harness/types.ts";
 import { rankDocuments } from "../search.ts";
 import type { JsonObject } from "../types.ts";
+import { type ArtifactScope, type CodemodeArtifactStore, filesystemArtifactStore } from "./artifacts.ts";
 import {
 	type CodemodeNamespace,
 	codemodeDescription,
@@ -116,17 +116,23 @@ type Start = {
 
 type RunState = {
 	start?: Start;
-	/** Directory of the result's files (the full output, images), created once: a rerun writes the same files again. */
-	outputDir?: string;
+	/** Artifact store state, committed before any write: a rerun overwrites artifacts in the same scope. */
+	artifacts?: { type: string; version: number; scope: ArtifactScope };
 	/** The outcome, decided once. */
 	result?: JsonObject;
 };
 
 export const CodemodeRunDoc = defineDoc<RunState>({
 	kind: "pi.codemode.run",
-	version: 1,
+	version: 2,
 	scope: "task",
 	initial: () => ({}),
+	migrate: (value) => {
+		const { outputDir, ...run } = value;
+		// Version 1 only used the filesystem store. Keep its directory and historical store version on replay.
+		if (outputDir !== undefined) run.artifacts = { type: "pi.filesystem", version: 1, scope: outputDir };
+		return run;
+	},
 	// The document retires with its task.
 	checkpointWhen: () => false,
 });
@@ -191,7 +197,7 @@ export type CodemodeNestedCall = {
  */
 export type CodemodeToolDetails = {
 	calls: CodemodeNestedCall[];
-	/** Temp file with the complete text output, when the output was cut to its token budget. */
+	/** Artifact reference with the complete text output, when cut to its token budget; a temp path by default. */
 	fullOutputPath?: string;
 };
 
@@ -217,6 +223,8 @@ export type CodemodeToolInput = Static<typeof codemodeSchema>;
 export type CodemodeToolOptions = {
 	/** Runs the scripts: `CodemodeSandbox` on Node, `RemoteCodemodeSandbox` on Cloudflare. */
 	readonly sandbox: CodemodeSandboxBase;
+	/** Storage for full text output and images. Defaults to temporary files in the call's execution environment. */
+	readonly artifactStore?: CodemodeArtifactStore;
 	/** Groups of tools by name prefix, such as MCP servers, for the `codemode` section and tool search. */
 	readonly namespaces?: readonly CodemodeNamespace[];
 	/** Estimated tokens the tool declarations in the `codemode` section may use. Default 3000. */
@@ -581,37 +589,43 @@ class CodemodeCall {
 		}, this.context);
 	}
 
-	/** Writes the result's files under fixed names into the run's output directory, so a rerun overwrites them. */
+	/** Writes artifacts under fixed names in the run's persisted scope, so a rerun overwrites them. */
 	private outputFiles(): OutputFile {
-		const env = this.api.env;
-		let directory: Promise<string> | undefined;
+		const store = this.options.artifactStore ?? (this.api.env && filesystemArtifactStore(this.api.env));
+		if (store === undefined) return async () => ({ error: "no execution environment" });
+		let scope: Promise<ArtifactScope> | undefined;
 		return async (name, data) => {
-			if (env === undefined) return { error: "no execution environment" };
 			try {
-				directory ??= this.outputDir(env);
-				const path = `${await directory}/${name}`;
-				const written = await env.writeFile(path, data, this.context);
-				return written.ok ? { path } : { error: written.error.message };
+				scope ??= this.artifactScope(store);
+				const path = await store.write(await scope, name, data, this.context);
+				return { path };
 			} catch (error) {
+				this.context.abortSignal?.throwIfAborted();
 				return { error: errorMessage(error) };
 			}
 		};
 	}
 
-	/** The run's output directory: the recorded one, else a new temp directory, recorded before any file is written. */
-	private async outputDir(env: ExecutionEnv): Promise<string> {
-		const recorded = await this.api.commit(
-			async (tx) => (await tx.doc(CodemodeRunDoc, this.api.taskId)).outputDir,
-			this.context,
-		);
-		if (recorded !== undefined) return recorded;
-		const created = await env.createTempDir("pi-codemode-", this.context);
-		if (!created.ok) throw new Error(created.error.message);
-		return this.api.commit(async (tx) => {
+	/** The run's artifact scope: the recorded one, else a new scope, recorded before any artifact is written. */
+	private async artifactScope(store: CodemodeArtifactStore): Promise<ArtifactScope> {
+		let artifacts = await this.api.commit(async (tx) => {
 			const run = await tx.doc(CodemodeRunDoc, this.api.taskId);
-			run.outputDir ??= created.value;
-			return run.outputDir!;
+			return run.artifacts === undefined ? undefined : { ...run.artifacts, scope: copyJson(run.artifacts.scope) };
 		}, this.context);
+		if (artifacts === undefined) {
+			const created = await store.initialize(this.api.taskId, this.context);
+			artifacts = await this.api.commit(async (tx) => {
+				const run = await tx.doc(CodemodeRunDoc, this.api.taskId);
+				run.artifacts ??= { type: store.type, version: store.version, scope: copyJson(created) };
+				return { ...run.artifacts, scope: copyJson(run.artifacts.scope) };
+			}, this.context);
+		}
+		if (artifacts.type !== store.type || artifacts.version !== store.version) {
+			throw new Error(
+				`Artifact store mismatch: recorded ${artifacts.type} version ${artifacts.version}, configured ${store.type} version ${store.version}`,
+			);
+		}
+		return artifacts.scope;
 	}
 
 	private async checkFingerprint(fingerprint: string): Promise<void> {

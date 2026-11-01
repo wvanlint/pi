@@ -1,3 +1,4 @@
+export type { ArtifactRef, ArtifactScope, CodemodeArtifactStore } from "./artifacts.ts";
 export {
 	CODEMODE_MODULE_VERSION,
 	CODEMODE_TOOL_NAME,
